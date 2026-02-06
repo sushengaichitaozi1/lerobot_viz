@@ -1,0 +1,40 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Build and caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+
+# Local databases and runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.rrd
+
+# Generated or heavy local assets
+project/data/
+project/tools/ffmpeg/
+project/backend/app/__pycache__/
+project/backend/app/services/__pycache__/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project-local tooling data
+.claude/
