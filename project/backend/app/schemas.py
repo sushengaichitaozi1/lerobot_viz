@@ -168,7 +168,36 @@ class DatasetDeleteResponse(BaseModel):
     deletedCount: int
 
 
+class DatasetUpdateRequest(BaseModel):
+    robot: Optional[str] = None
+    task_type: Optional[str] = Field(default=None, alias="task_type")
+    storage_path: Optional[str] = Field(default=None, alias="storage_path")
+
+
+class DatasetUpdateResponse(BaseModel):
+    success: bool
+    message: str
+    updatedCount: int
+    robot: Optional[str] = None
+    taskType: Optional[str] = None
+    storagePath: Optional[str] = None
+
+
 class ItemDeleteResponse(BaseModel):
+    success: bool
+    message: str
+    itemId: int
+
+
+class ItemUpdateRequest(BaseModel):
+    episode_id: Optional[str] = Field(default=None, alias="episode_id")
+    robot: Optional[str] = None
+    task_type: Optional[str] = Field(default=None, alias="task_type")
+    file_path: Optional[str] = Field(default=None, alias="file_path")
+    storage_path: Optional[str] = Field(default=None, alias="storage_path")
+
+
+class ItemUpdateResponse(BaseModel):
     success: bool
     message: str
     itemId: int

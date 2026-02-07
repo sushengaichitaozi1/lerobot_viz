@@ -148,6 +148,9 @@
             <button @click="backToDatasets" class="px-3 py-1 rounded border text-slate-600">
                 返回数据集
             </button>
+            <button @click="editDataset(selectedDataset)" :disabled="!selectedDataset" class="px-3 py-1 rounded border border-blue-200 text-blue-600 hover:bg-blue-50 disabled:opacity-40">
+                Edit Dataset
+            </button>
             <button @click="deleteDataset(selectedDataset)" :disabled="!selectedDataset" class="px-3 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50 disabled:opacity-40">
                 Delete Dataset
             </button>
@@ -181,6 +184,9 @@
                                 <span class="text-[10px] px-2 py-1 rounded-full bg-emerald-50 text-emerald-700">
                                     {{ dataset.episodeCount }} eps
                                 </span>
+                                <button @click.stop="editDataset(dataset)" class="text-[10px] px-2 py-1 rounded border border-blue-200 text-blue-600 hover:bg-blue-50">
+                                    Edit
+                                </button>
                                 <button @click.stop="deleteDataset(dataset)" class="text-[10px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
                                     Delete
                                 </button>
@@ -219,6 +225,9 @@
                                 <span class="text-[10px] px-2 py-1 rounded-full bg-blue-50 text-blue-700">
                                     {{ item.cameraCount || 0 }} cams
                                 </span>
+                                <button @click.stop="editItem(item)" class="text-[10px] px-2 py-1 rounded border border-blue-200 text-blue-600 hover:bg-blue-50">
+                                    Edit
+                                </button>
                                 <button @click.stop="deleteItem(item)" class="text-[10px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
                                     Delete
                                 </button>
@@ -257,6 +266,9 @@
                         <p class="text-xs text-slate-500">{{ detail?.robot?.displayName || detail?.robot?.name }} - {{ detail?.taskType?.displayName || detail?.taskType?.name }}</p>
                     </div>
                     <div class="flex items-center gap-2">
+                        <button @click="editSelectedItem" class="text-[11px] px-2 py-1 rounded border border-blue-200 text-blue-600 hover:bg-blue-50">
+                            Edit Episode
+                        </button>
                         <button @click="deleteSelectedItem" class="text-[11px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
                             Delete Episode
                         </button>
@@ -833,7 +845,16 @@ createApp({
             }
             if (!res.ok) {
                 const text = await res.text();
-                throw new Error(text || 'Request failed');
+                let message = text || 'Request failed';
+                try {
+                    const parsed = JSON.parse(text);
+                    if (parsed && parsed.detail) {
+                        message = parsed.detail;
+                    }
+                } catch (e) {
+                    // Keep raw text if response is not JSON.
+                }
+                throw new Error(message);
             }
             const contentType = res.headers.get('content-type') || '';
             if (contentType.includes('application/json')) {
@@ -852,6 +873,24 @@ createApp({
                 base = base.slice(0, -4);
             }
             return base || 'http://localhost:8899';
+        },
+        encodeDatasetPath(path) {
+            if (!path) return '';
+            const bytes = new TextEncoder().encode(path);
+            let binary = '';
+            for (const byte of bytes) {
+                binary += String.fromCharCode(byte);
+            }
+            return btoa(binary)
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/, '');
+        },
+        datasetIdParam(dataset) {
+            if (!dataset || dataset.id === undefined || dataset.id === null) {
+                return '';
+            }
+            return encodeURIComponent(String(dataset.id));
         },
         async bootstrap() {
             await this.fetchRobots();
@@ -883,7 +922,21 @@ createApp({
                     page: this.page,
                     page_size: this.pageSize
                 });
-                const data = await this.apiFetch(`${this.apiBase}/datasets/${this.selectedDataset.id}/items?${params.toString()}`);
+                const datasetId = this.datasetIdParam(this.selectedDataset);
+                let data;
+                try {
+                    data = await this.apiFetch(`${this.apiBase}/datasets/${datasetId}/items?${params.toString()}`);
+                } catch (err) {
+                    const canRetry = err.message === 'Not Found' && this.selectedDataset.path;
+                    if (!canRetry) throw err;
+
+                    const fallbackId = this.encodeDatasetPath(this.selectedDataset.path);
+                    if (!fallbackId || String(this.selectedDataset.id) === fallbackId) {
+                        throw err;
+                    }
+                    this.selectedDataset.id = fallbackId;
+                    data = await this.apiFetch(`${this.apiBase}/datasets/${encodeURIComponent(fallbackId)}/items?${params.toString()}`);
+                }
                 this.items = data.items || [];
                 this.total = data.total || 0;
             } finally {
@@ -925,13 +978,95 @@ createApp({
             this.page = 1;
             await this.fetchDatasets();
         },
+        async editDataset(dataset) {
+            if (!dataset || !dataset.id) return;
+
+            const robotInput = window.prompt('Robot name', dataset.robot || '');
+            if (robotInput === null) return;
+            const taskInput = window.prompt('Task type', dataset.taskType || '');
+            if (taskInput === null) return;
+            const pathInput = window.prompt('Storage path (local dataset path)', dataset.path || '');
+            if (pathInput === null) return;
+
+            const robot = robotInput.trim();
+            const taskType = taskInput.trim();
+            const storagePath = pathInput.trim();
+            const payload = {};
+            if (robot && robot !== (dataset.robot || '')) payload.robot = robot;
+            if (taskType && taskType !== (dataset.taskType || '')) payload.task_type = taskType;
+            if (storagePath && storagePath !== (dataset.path || '')) payload.storage_path = storagePath;
+
+            if (!Object.keys(payload).length) {
+                window.alert('No changes');
+                return;
+            }
+
+            try {
+                let response;
+                try {
+                    response = await this.apiRequest(
+                        `${this.apiBase}/datasets/${this.datasetIdParam(dataset)}?update_local=true&force_local=true`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        }
+                    );
+                } catch (err) {
+                    const canRetry = err.message === 'Not Found' && dataset.path;
+                    if (!canRetry) throw err;
+                    const fallbackId = this.encodeDatasetPath(dataset.path);
+                    if (!fallbackId || String(dataset.id) === fallbackId) throw err;
+                    dataset.id = fallbackId;
+                    response = await this.apiRequest(
+                        `${this.apiBase}/datasets/${encodeURIComponent(fallbackId)}?update_local=true&force_local=true`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        }
+                    );
+                }
+
+                const wasSelected = this.selectedDataset && this.selectedDataset.id === dataset.id;
+                const newPath = (response && response.storagePath) || payload.storage_path || dataset.path;
+
+                await this.fetchDatasets();
+
+                if (wasSelected) {
+                    const matched = this.datasets.find(ds => ds.path === newPath);
+                    if (matched) {
+                        this.selectedDataset = matched;
+                        await this.fetchItems();
+                    } else {
+                        await this.backToDatasets();
+                    }
+                }
+
+                window.alert((response && response.message) || 'Dataset updated');
+            } catch (err) {
+                window.alert(err.message || 'Update dataset failed');
+            }
+        },
         async deleteDataset(dataset) {
             if (!dataset || !dataset.id) return;
             const ok = window.confirm(`Delete dataset ${dataset.name} and all episodes?`);
             if (!ok) return;
 
             try {
-                await this.apiRequest(`${this.apiBase}/datasets/${dataset.id}`, { method: 'DELETE' });
+                try {
+                    await this.apiRequest(`${this.apiBase}/datasets/${this.datasetIdParam(dataset)}`, { method: 'DELETE' });
+                } catch (err) {
+                    const canRetry = err.message === 'Not Found' && dataset.path;
+                    if (!canRetry) throw err;
+
+                    const fallbackId = this.encodeDatasetPath(dataset.path);
+                    if (!fallbackId || String(dataset.id) === fallbackId) {
+                        throw err;
+                    }
+                    dataset.id = fallbackId;
+                    await this.apiRequest(`${this.apiBase}/datasets/${encodeURIComponent(fallbackId)}`, { method: 'DELETE' });
+                }
                 if (this.selectedDataset && this.selectedDataset.id === dataset.id) {
                     await this.backToDatasets();
                 } else {
@@ -939,6 +1074,49 @@ createApp({
                 }
             } catch (err) {
                 window.alert(err.message || 'Delete dataset failed');
+            }
+        },
+        async editItem(item) {
+            if (!item || !item.id) return;
+
+            const episodeInput = window.prompt('Episode ID', item.episodeId || '');
+            if (episodeInput === null) return;
+            const taskInput = window.prompt('Task type', item.taskType || '');
+            if (taskInput === null) return;
+
+            const payload = {};
+            const episodeId = episodeInput.trim();
+            const taskType = taskInput.trim();
+            if (episodeId && episodeId !== (item.episodeId || '')) payload.episode_id = episodeId;
+            if (taskType && taskType !== (item.taskType || '')) payload.task_type = taskType;
+
+            if (!Object.keys(payload).length) {
+                window.alert('No changes');
+                return;
+            }
+
+            try {
+                const response = await this.apiRequest(`${this.apiBase}/items/${item.id}?update_local=false`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const selectedId = this.selectedItem ? this.selectedItem.id : null;
+                await this.fetchItems();
+                await this.fetchDatasets();
+
+                if (selectedId) {
+                    const matched = this.items.find(it => it.id === selectedId);
+                    if (matched) {
+                        this.selectedItem = matched;
+                        await this.loadItemDetail();
+                    }
+                }
+
+                window.alert((response && response.message) || 'Episode updated');
+            } catch (err) {
+                window.alert(err.message || 'Update episode failed');
             }
         },
         async deleteItem(item) {
@@ -982,6 +1160,10 @@ createApp({
             this.rerunMessage = '';
             await this.loadItemDetail();
             this.openViewer();
+        },
+        async editSelectedItem() {
+            if (!this.selectedItem) return;
+            await this.editItem(this.selectedItem);
         },
         async deleteSelectedItem() {
             if (!this.selectedItem) return;

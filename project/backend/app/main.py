@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, joinedload
 from . import auth, indexer, models, schemas
 from .config import settings
 from .db import SessionLocal, engine, get_db
-from .services import lerobot_v3, parser_service, rerun_viz, thumbnail, video_streamer
+from .services import dataset_editor, lerobot_v3, parser_service, rerun_viz, thumbnail, video_streamer
 
 
 app = FastAPI(title=settings.api_title)
@@ -119,6 +119,15 @@ def _dataset_path_filter(dataset_path: str):
     )
 
 
+def _delete_dataset_items(db: Session, dataset_path: str) -> int:
+    items = db.query(models.Item).filter(_dataset_path_filter(dataset_path)).all()
+    for item in items:
+        db.delete(item)
+    if items:
+        db.flush()
+    return len(items)
+
+
 def _cleanup_orphan_entities(db: Session) -> None:
     orphan_task_types = db.query(models.TaskType).filter(~models.TaskType.items.any()).all()
     for task_type in orphan_task_types:
@@ -129,6 +138,60 @@ def _cleanup_orphan_entities(db: Session) -> None:
     orphan_robots = db.query(models.Robot).filter(~models.Robot.task_types.any()).all()
     for robot in orphan_robots:
         db.delete(robot)
+
+
+def _normalize_non_empty(value: Optional[str], field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty")
+    return normalized
+
+
+def _upsert_robot(db: Session, name: str) -> models.Robot:
+    robot = db.query(models.Robot).filter(models.Robot.name == name).one_or_none()
+    if robot:
+        return robot
+
+    robot = models.Robot(name=name, display_name=name)
+    db.add(robot)
+    db.flush()
+    return robot
+
+
+def _upsert_task_type(db: Session, robot: models.Robot, name: str) -> models.TaskType:
+    task_type = (
+        db.query(models.TaskType)
+        .filter(models.TaskType.robot_id == robot.id, models.TaskType.name == name)
+        .one_or_none()
+    )
+    if task_type:
+        return task_type
+
+    task_type = models.TaskType(
+        name=name,
+        display_name=name.replace("_", " ").title(),
+        robot_id=robot.id,
+    )
+    db.add(task_type)
+    db.flush()
+    return task_type
+
+
+def _resolve_target_robot_task(
+    db: Session,
+    current_item: models.Item,
+    robot: Optional[str],
+    task_type: Optional[str],
+) -> tuple[models.Robot, models.TaskType]:
+    robot_name = robot if robot is not None else (current_item.robot.name if current_item.robot else None)
+    task_name = task_type if task_type is not None else (current_item.task_type.name if current_item.task_type else None)
+
+    if robot_name is None or task_name is None:
+        raise HTTPException(status_code=400, detail="robot and task_type are required")
+
+    robot_entity = _upsert_robot(db, _normalize_non_empty(robot_name, "robot"))
+    task_entity = _upsert_task_type(db, robot_entity, _normalize_non_empty(task_name, "task_type"))
+    return robot_entity, task_entity
 
 
 def _build_robot_summary(robot: models.Robot, type_count: int, episode_count: int) -> schemas.RobotSummary:
@@ -463,6 +526,261 @@ def get_item(
     )
 
 
+@app.put("/datasets/{datasetId}", response_model=schemas.DatasetUpdateResponse)
+def update_dataset(
+    datasetId: str,
+    payload: schemas.DatasetUpdateRequest,
+    update_local: bool = Query(default=True, alias="update_local"),
+    force_local: bool = Query(default=True, alias="force_local"),
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    dataset_path = _decode_dataset_id(datasetId)
+    items = (
+        db.query(models.Item)
+        .options(joinedload(models.Item.robot), joinedload(models.Item.task_type))
+        .filter(_dataset_path_filter(dataset_path))
+        .all()
+    )
+    if not items:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    requested_robot = _normalize_non_empty(payload.robot, "robot") if payload.robot is not None else None
+    requested_task = _normalize_non_empty(payload.task_type, "task_type") if payload.task_type is not None else None
+    requested_storage = (
+        _normalize_non_empty(payload.storage_path, "storage_path")
+        if payload.storage_path is not None
+        else None
+    )
+
+    if update_local:
+        local_root = Path(dataset_path).expanduser().resolve()
+        if not local_root.exists():
+            raise HTTPException(status_code=404, detail=f"Local dataset path not found: {local_root}")
+
+        desired_root = local_root
+        local_changed = False
+
+        if requested_storage is not None:
+            desired_root = Path(requested_storage).expanduser().resolve()
+        elif requested_robot is not None or requested_task is not None:
+            parsed_robot, parsed_task, parsed_date = parser_service.parse_dataset_name(local_root.name)
+            resolved_robot = requested_robot or parsed_robot or (items[0].robot.name if items[0].robot else None)
+            resolved_task = requested_task or parsed_task or (items[0].task_type.name if items[0].task_type else None)
+            if resolved_robot and resolved_task:
+                date_token = parsed_date or datetime.utcnow().date().isoformat()
+                desired_root = local_root.with_name(f"{resolved_robot}_{resolved_task}_{date_token}")
+
+        if desired_root != local_root:
+            try:
+                desired_root = dataset_editor.move_dataset_root(local_root, desired_root, force_unlock=force_local)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to move local dataset: {exc}") from exc
+            local_root = desired_root
+            local_changed = True
+
+        try:
+            metadata_changed = dataset_editor.update_v3_dataset_metadata(
+                local_root,
+                robot=requested_robot,
+                task_type=requested_task,
+            )
+            local_changed = local_changed or metadata_changed
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to update local dataset metadata: {exc}") from exc
+
+        if local_changed:
+            try:
+                _delete_dataset_items(db, dataset_path)
+                _delete_dataset_items(db, str(local_root))
+                _cleanup_orphan_entities(db)
+                db.commit()
+
+                indexer.index_dataset(db, local_root)
+                _cleanup_orphan_entities(db)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Local dataset updated but database sync failed: {exc}",
+                ) from exc
+
+            refreshed_items = (
+                db.query(models.Item)
+                .options(joinedload(models.Item.robot), joinedload(models.Item.task_type))
+                .filter(_dataset_path_filter(str(local_root)))
+                .all()
+            )
+            if not refreshed_items:
+                raise HTTPException(status_code=500, detail="Dataset reindex produced no items")
+
+            first_item = refreshed_items[0]
+            return schemas.DatasetUpdateResponse(
+                success=True,
+                message="Dataset updated locally and synchronized",
+                updatedCount=len(refreshed_items),
+                robot=first_item.robot.name if first_item.robot else None,
+                taskType=first_item.task_type.name if first_item.task_type else None,
+                storagePath=str(local_root),
+            )
+
+        first_item = items[0]
+        return schemas.DatasetUpdateResponse(
+            success=True,
+            message="No local changes applied",
+            updatedCount=0,
+            robot=first_item.robot.name if first_item.robot else None,
+            taskType=first_item.task_type.name if first_item.task_type else None,
+            storagePath=str(local_root),
+        )
+
+    target_robot = None
+    target_task_type = None
+    if requested_robot is not None or requested_task is not None:
+        target_robot, target_task_type = _resolve_target_robot_task(
+            db,
+            items[0],
+            requested_robot,
+            requested_task,
+        )
+
+    updated_count = 0
+    for item in items:
+        changed = False
+
+        if target_robot and item.robot_id != target_robot.id:
+            item.robot_id = target_robot.id
+            changed = True
+
+        if target_task_type and item.task_type_id != target_task_type.id:
+            item.task_type_id = target_task_type.id
+            changed = True
+
+        if requested_storage is not None and item.storage_path != requested_storage:
+            item.storage_path = requested_storage
+            changed = True
+
+        if changed:
+            updated_count += 1
+
+    if updated_count > 0:
+        db.flush()
+        _cleanup_orphan_entities(db)
+        db.commit()
+
+    first_item = items[0]
+    return schemas.DatasetUpdateResponse(
+        success=True,
+        message="Dataset updated" if updated_count > 0 else "No changes applied",
+        updatedCount=updated_count,
+        robot=target_robot.name if target_robot else first_item.robot.name if first_item.robot else None,
+        taskType=(
+            target_task_type.name
+            if target_task_type
+            else first_item.task_type.name
+            if first_item.task_type
+            else None
+        ),
+        storagePath=requested_storage if requested_storage is not None else dataset_path,
+    )
+
+
+@app.put("/items/{itemId}", response_model=schemas.ItemUpdateResponse)
+def update_item(
+    itemId: int,
+    payload: schemas.ItemUpdateRequest,
+    update_local: bool = Query(default=False, alias="update_local"),
+    force_local: bool = Query(default=True, alias="force_local"),
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    item = (
+        db.query(models.Item)
+        .options(joinedload(models.Item.robot), joinedload(models.Item.task_type))
+        .filter(models.Item.id == itemId)
+        .one_or_none()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    requested_episode_id = _normalize_non_empty(payload.episode_id, "episode_id") if payload.episode_id is not None else None
+    requested_file_path = _normalize_non_empty(payload.file_path, "file_path") if payload.file_path is not None else None
+    requested_storage_path = (
+        _normalize_non_empty(payload.storage_path, "storage_path")
+        if payload.storage_path is not None
+        else None
+    )
+    requested_robot = _normalize_non_empty(payload.robot, "robot") if payload.robot is not None else None
+    requested_task = _normalize_non_empty(payload.task_type, "task_type") if payload.task_type is not None else None
+
+    if update_local:
+        dataset_root = _dataset_root_for_item(item)
+        if lerobot_v3.is_v3_dataset_root(dataset_root):
+            raise HTTPException(
+                status_code=400,
+                detail="Local episode edit for LeRobot v3 is not supported. Use dataset edit instead.",
+            )
+
+        if requested_file_path is not None and requested_file_path != item.file_path:
+            try:
+                moved_path = dataset_editor.move_dataset_root(
+                    Path(item.file_path),
+                    Path(requested_file_path),
+                    force_unlock=force_local,
+                )
+                requested_file_path = str(moved_path)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to move local episode path: {exc}") from exc
+
+    changed = False
+
+    if requested_robot is not None or requested_task is not None:
+        target_robot, target_task_type = _resolve_target_robot_task(
+            db,
+            item,
+            requested_robot,
+            requested_task,
+        )
+        if item.robot_id != target_robot.id:
+            item.robot_id = target_robot.id
+            changed = True
+        if item.task_type_id != target_task_type.id:
+            item.task_type_id = target_task_type.id
+            changed = True
+
+    if requested_episode_id is not None and item.episode_id != requested_episode_id:
+        item.episode_id = requested_episode_id
+        changed = True
+
+    if requested_file_path is not None and item.file_path != requested_file_path:
+        item.file_path = requested_file_path
+        changed = True
+
+    if requested_storage_path is not None and item.storage_path != requested_storage_path:
+        item.storage_path = requested_storage_path
+        changed = True
+
+    if changed:
+        db.flush()
+        _cleanup_orphan_entities(db)
+        db.commit()
+
+    return schemas.ItemUpdateResponse(
+        success=True,
+        message="Episode updated" if changed else "No changes applied",
+        itemId=itemId,
+    )
+
+
 @app.delete("/datasets/{datasetId}", response_model=schemas.DatasetDeleteResponse)
 def delete_dataset(
     datasetId: str,
@@ -470,19 +788,10 @@ def delete_dataset(
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
     dataset_path = _decode_dataset_id(datasetId)
-    items = (
-        db.query(models.Item)
-        .filter(_dataset_path_filter(dataset_path))
-        .all()
-    )
-    if not items:
+    deleted_count = _delete_dataset_items(db, dataset_path)
+    if deleted_count <= 0:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    deleted_count = len(items)
-    for item in items:
-        db.delete(item)
-
-    db.flush()
     _cleanup_orphan_entities(db)
     db.commit()
     return schemas.DatasetDeleteResponse(
@@ -495,6 +804,8 @@ def delete_dataset(
 @app.delete("/items/{itemId}", response_model=schemas.ItemDeleteResponse)
 def delete_item(
     itemId: int,
+    delete_local: bool = Query(default=True, alias="delete_local"),
+    force_local: bool = Query(default=True, alias="force_local"),
     db: Session = Depends(get_db),
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
@@ -502,13 +813,63 @@ def delete_item(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
+    dataset_root = _dataset_root_for_item(item)
+
+    if delete_local and dataset_root.exists() and lerobot_v3.is_v3_dataset_root(dataset_root):
+        episode_index = lerobot_v3.parse_episode_index(item.episode_id)
+        if episode_index is None:
+            raise HTTPException(status_code=400, detail="Episode index not found")
+
+        try:
+            dataset_editor.delete_v3_episode(dataset_root, episode_index, force_unlock=force_local)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete local episode: {exc}") from exc
+
+        _delete_dataset_items(db, str(dataset_root))
+        db.commit()
+
+        try:
+            indexer.index_dataset(db, dataset_root)
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Local episode deleted but database reindex failed: {exc}",
+            ) from exc
+
+        _cleanup_orphan_entities(db)
+        db.commit()
+        return schemas.ItemDeleteResponse(
+            success=True,
+            message="Episode deleted locally and database synchronized",
+            itemId=itemId,
+        )
+
+    local_deleted = False
+    if delete_local:
+        try:
+            local_deleted = dataset_editor.delete_episode_file(Path(item.file_path))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete local episode file: {exc}") from exc
+
     db.delete(item)
     db.flush()
     _cleanup_orphan_entities(db)
     db.commit()
+
+    message = "Episode deleted from database"
+    if delete_local and local_deleted:
+        message = "Episode deleted locally and from database"
+    elif delete_local and not local_deleted:
+        message = "Local episode file not found; removed from database"
+
     return schemas.ItemDeleteResponse(
         success=True,
-        message="Episode deleted from database",
+        message=message,
         itemId=itemId,
     )
 
