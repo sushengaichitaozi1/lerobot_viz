@@ -152,6 +152,18 @@ def _parse_dataset_name(dataset_name: str) -> tuple[Optional[str], Optional[str]
     return robot_name, task_name
 
 
+def _infer_storage_path(file_path: Path) -> Path:
+    path = file_path if file_path.is_dir() else file_path.parent
+    if lerobot_v3.is_v3_dataset_root(path):
+        return path
+
+    if "episodes" in path.parts:
+        idx = path.parts.index("episodes")
+        if idx > 0:
+            return Path(*path.parts[:idx])
+    return path
+
+
 def _pick_primary_camera(cameras: list[dict]) -> Optional[dict]:
     if not cameras:
         return None
@@ -429,6 +441,7 @@ def _upsert_item(
             task_type_id=task_type.id,
             episode_id=meta.episode_id,
             file_path=str(meta.file_path),
+            storage_path=str(_infer_storage_path(meta.file_path)),
         )
         db.add(item)
         db.flush()
@@ -438,6 +451,7 @@ def _upsert_item(
         item.episode_id = meta.episode_id
 
     item.file_path = str(meta.file_path)
+    item.storage_path = str(_infer_storage_path(meta.file_path))
     item.total_frames = meta.total_frames
     item.fps = meta.fps
     item.duration_s = meta.duration_s
@@ -457,11 +471,19 @@ def _refresh_cameras(db: Session, item: models.Item, cameras: list[dict]) -> Non
     existing = db.query(models.CameraInfo).filter(models.CameraInfo.item_id == item.id).all()
     for cam in existing:
         db.delete(cam)
+    if existing:
+        db.flush()
+
+    seen_camera_keys: set[str] = set()
     for camera in cameras:
+        camera_key = camera["camera_key"]
+        if camera_key in seen_camera_keys:
+            continue
+        seen_camera_keys.add(camera_key)
         db.add(
             models.CameraInfo(
                 item_id=item.id,
-                camera_key=camera["camera_key"],
+                camera_key=camera_key,
                 display_name=camera["display_name"],
                 image_path=camera["image_path"],
                 frame_count=camera["frame_count"],

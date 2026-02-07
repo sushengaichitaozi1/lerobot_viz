@@ -56,6 +56,7 @@ class Item(Base):
     robot_id = Column(Integer, ForeignKey("robots.id", ondelete="CASCADE"), nullable=False, index=True)
     task_type_id = Column(Integer, ForeignKey("task_types.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(String(1024), nullable=False)
+    storage_path = Column(String(1024))
     total_frames = Column(Integer)
     fps = Column(Float)
     duration_s = Column(Float)

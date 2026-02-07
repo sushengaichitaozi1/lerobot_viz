@@ -148,6 +148,9 @@
             <button @click="backToDatasets" class="px-3 py-1 rounded border text-slate-600">
                 返回数据集
             </button>
+            <button @click="deleteDataset(selectedDataset)" :disabled="!selectedDataset" class="px-3 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50 disabled:opacity-40">
+                Delete Dataset
+            </button>
             <button @click="changePage(-1)" :disabled="page === 1" class="px-3 py-1 rounded border text-slate-600 disabled:opacity-40">
                 上一页
             </button>
@@ -172,11 +175,16 @@
                     class="bg-white/90 border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition cursor-pointer overflow-hidden"
                 >
                     <div class="p-4 space-y-2">
-                        <div class="flex items-center justify-between">
-                            <h3 class="font-semibold text-sm text-slate-900">{{ dataset.name }}</h3>
-                            <span class="text-[10px] px-2 py-1 rounded-full bg-emerald-50 text-emerald-700">
-                                {{ dataset.episodeCount }} eps
-                            </span>
+                        <div class="flex items-center justify-between gap-2">
+                            <h3 class="font-semibold text-sm text-slate-900 truncate">{{ dataset.name }}</h3>
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] px-2 py-1 rounded-full bg-emerald-50 text-emerald-700">
+                                    {{ dataset.episodeCount }} eps
+                                </span>
+                                <button @click.stop="deleteDataset(dataset)" class="text-[10px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
+                                    Delete
+                                </button>
+                            </div>
                         </div>
                         <div class="text-xs text-slate-500">
                             <span>{{ dataset.robot || '未知机器人' }}</span>
@@ -205,11 +213,16 @@
                         />
                     </div>
                     <div class="p-4 space-y-2">
-                        <div class="flex items-center justify-between">
+                        <div class="flex items-center justify-between gap-2">
                             <h3 class="font-semibold text-sm text-slate-900">{{ item.episodeId || 'Episode' }}</h3>
-                            <span class="text-[10px] px-2 py-1 rounded-full bg-blue-50 text-blue-700">
-                                {{ item.cameraCount || 0 }} cams
-                            </span>
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] px-2 py-1 rounded-full bg-blue-50 text-blue-700">
+                                    {{ item.cameraCount || 0 }} cams
+                                </span>
+                                <button @click.stop="deleteItem(item)" class="text-[10px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
+                                    Delete
+                                </button>
+                            </div>
                         </div>
                         <div class="text-xs text-slate-500">
                             <span>{{ item.robot }}</span>
@@ -243,9 +256,14 @@
                         <h2 class="text-lg font-bold">{{ detail?.episodeId }}</h2>
                         <p class="text-xs text-slate-500">{{ detail?.robot?.displayName || detail?.robot?.name }} - {{ detail?.taskType?.displayName || detail?.taskType?.name }}</p>
                     </div>
-                    <button class="text-slate-400 hover:text-slate-600 lg:hidden" @click="closeDetail">
-                        <i class="fas fa-times"></i>
-                    </button>
+                    <div class="flex items-center gap-2">
+                        <button @click="deleteSelectedItem" class="text-[11px] px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50">
+                            Delete Episode
+                        </button>
+                        <button class="text-slate-400 hover:text-slate-600 lg:hidden" @click="closeDetail">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
                 </div>
 
                 <div class="bg-slate-900 rounded-xl overflow-hidden">
@@ -802,19 +820,29 @@ createApp({
                 this.dataset.message = err.message || '索引状态查询失败';
             }
         },
-        async apiFetch(url) {
+        async apiRequest(url, options = {}) {
             this.apiBase = this.normalizeApiBase(this.apiBase);
-            const headers = this.token ? { 'Authorization': `Bearer ${this.token}` } : {};
-            const res = await fetch(url, { headers });
+            const headers = { ...(options.headers || {}) };
+            if (this.token) {
+                headers['Authorization'] = `Bearer ${this.token}`;
+            }
+            const res = await fetch(url, { ...options, headers });
             if (res.status === 401) {
                 this.openAuth();
-                throw new Error('未授权');
+                throw new Error('Unauthorized');
             }
             if (!res.ok) {
                 const text = await res.text();
-                throw new Error(text || '请求失败');
+                throw new Error(text || 'Request failed');
             }
-            return res.json();
+            const contentType = res.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                return res.json();
+            }
+            return null;
+        },
+        async apiFetch(url) {
+            return this.apiRequest(url, { method: 'GET' });
         },
         normalizeApiBase(value) {
             if (!value) return 'http://localhost:8899';
@@ -897,6 +925,39 @@ createApp({
             this.page = 1;
             await this.fetchDatasets();
         },
+        async deleteDataset(dataset) {
+            if (!dataset || !dataset.id) return;
+            const ok = window.confirm(`Delete dataset ${dataset.name} and all episodes?`);
+            if (!ok) return;
+
+            try {
+                await this.apiRequest(`${this.apiBase}/datasets/${dataset.id}`, { method: 'DELETE' });
+                if (this.selectedDataset && this.selectedDataset.id === dataset.id) {
+                    await this.backToDatasets();
+                } else {
+                    await this.fetchDatasets();
+                }
+            } catch (err) {
+                window.alert(err.message || 'Delete dataset failed');
+            }
+        },
+        async deleteItem(item) {
+            if (!item || !item.id) return;
+            const episodeName = item.episodeId || `#${item.id}`;
+            const ok = window.confirm(`Delete episode ${episodeName}?`);
+            if (!ok) return;
+
+            try {
+                await this.apiRequest(`${this.apiBase}/items/${item.id}`, { method: 'DELETE' });
+                if (this.selectedItem && this.selectedItem.id === item.id) {
+                    this.closeDetail();
+                }
+                await this.fetchItems();
+                await this.fetchDatasets();
+            } catch (err) {
+                window.alert(err.message || 'Delete episode failed');
+            }
+        },
         async selectRobot(robot) {
             this.selectedRobot = robot;
             this.selectedDataset = null;
@@ -921,6 +982,10 @@ createApp({
             this.rerunMessage = '';
             await this.loadItemDetail();
             this.openViewer();
+        },
+        async deleteSelectedItem() {
+            if (!this.selectedItem) return;
+            await this.deleteItem(this.selectedItem);
         },
         closeDetail() {
             this.selectedItem = null;

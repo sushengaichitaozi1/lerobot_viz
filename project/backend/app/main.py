@@ -4,19 +4,19 @@ from datetime import datetime
 import json
 import base64
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func
+from sqlalchemy import func, inspect, or_, text
 from sqlalchemy.orm import Session, joinedload
 
 from . import auth, indexer, models, schemas
 from .config import settings
 from .db import SessionLocal, engine, get_db
-from .services import lerobot_v3, rerun_viz, thumbnail, video_streamer
+from .services import lerobot_v3, parser_service, rerun_viz, thumbnail, video_streamer
 
 
 app = FastAPI(title=settings.api_title)
@@ -33,9 +33,24 @@ settings.data_root.mkdir(parents=True, exist_ok=True)
 settings.rerun_downloads_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_items_storage_path_column() -> None:
+    inspector = inspect(engine)
+    if "items" not in inspector.get_table_names():
+        return
+
+    column_names = {col["name"] for col in inspector.get_columns("items")}
+    if "storage_path" in column_names:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE items ADD COLUMN storage_path VARCHAR(1024)"))
+        conn.execute(text("UPDATE items SET storage_path = file_path WHERE storage_path IS NULL"))
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     models.Base.metadata.create_all(bind=engine)
+    _ensure_items_storage_path_column()
     rerun_viz.cleanup_old_rrd_files()
 
 
@@ -84,6 +99,9 @@ def _decode_dataset_id(dataset_id: str) -> str:
 
 
 def _dataset_root_for_item(item: models.Item) -> Path:
+    if item.storage_path:
+        return Path(item.storage_path)
+
     path = Path(item.file_path)
     if lerobot_v3.is_v3_dataset_root(path):
         return path
@@ -92,6 +110,25 @@ def _dataset_root_for_item(item: models.Item) -> Path:
         idx = probe.parts.index("episodes")
         return Path(*probe.parts[:idx])
     return probe
+
+
+def _dataset_path_filter(dataset_path: str):
+    return or_(
+        models.Item.storage_path == dataset_path,
+        models.Item.file_path == dataset_path,
+    )
+
+
+def _cleanup_orphan_entities(db: Session) -> None:
+    orphan_task_types = db.query(models.TaskType).filter(~models.TaskType.items.any()).all()
+    for task_type in orphan_task_types:
+        db.delete(task_type)
+    if orphan_task_types:
+        db.flush()
+
+    orphan_robots = db.query(models.Robot).filter(~models.Robot.task_types.any()).all()
+    for robot in orphan_robots:
+        db.delete(robot)
 
 
 def _build_robot_summary(robot: models.Robot, type_count: int, episode_count: int) -> schemas.RobotSummary:
@@ -134,6 +171,7 @@ def _build_item_summary(request: Request, item: models.Item) -> schemas.ItemSumm
         episodeId=item.episode_id,
         robot=item.robot.name if item.robot else None,
         taskType=item.task_type.name if item.task_type else None,
+        storagePath=item.storage_path,
         thumbnailUrl=_thumbnail_url(request, item.id, camera_key),
         totalFrames=item.total_frames,
         duration=item.duration_s,
@@ -313,7 +351,7 @@ def list_dataset_items(
             joinedload(models.Item.cameras),
         )
         .filter(models.Item.deleted_at.is_(None))
-        .filter(models.Item.file_path.startswith(dataset_path))
+        .filter(_dataset_path_filter(dataset_path))
     )
 
     total = query.count()
@@ -412,6 +450,7 @@ def get_item(
             displayName=item.task_type.display_name or item.task_type.name,
         ),
         filePath=item.file_path,
+        storagePath=item.storage_path,
         totalFrames=item.total_frames,
         fps=item.fps,
         duration=item.duration_s,
@@ -421,6 +460,56 @@ def get_item(
         totalSizeBytes=item.total_size_bytes,
         cameraCount=item.camera_count,
         cameras=cameras,
+    )
+
+
+@app.delete("/datasets/{datasetId}", response_model=schemas.DatasetDeleteResponse)
+def delete_dataset(
+    datasetId: str,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    dataset_path = _decode_dataset_id(datasetId)
+    items = (
+        db.query(models.Item)
+        .filter(_dataset_path_filter(dataset_path))
+        .all()
+    )
+    if not items:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    deleted_count = len(items)
+    for item in items:
+        db.delete(item)
+
+    db.flush()
+    _cleanup_orphan_entities(db)
+    db.commit()
+    return schemas.DatasetDeleteResponse(
+        success=True,
+        message="Dataset deleted from database",
+        deletedCount=deleted_count,
+    )
+
+
+@app.delete("/items/{itemId}", response_model=schemas.ItemDeleteResponse)
+def delete_item(
+    itemId: int,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    item = db.get(models.Item, itemId)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    db.delete(item)
+    db.flush()
+    _cleanup_orphan_entities(db)
+    db.commit()
+    return schemas.ItemDeleteResponse(
+        success=True,
+        message="Episode deleted from database",
+        itemId=itemId,
     )
 
 
@@ -634,51 +723,55 @@ def _find_dataset_dirs(root: Path) -> list[Path]:
     return candidates
 
 
-@app.post("/datasets/register", response_model=schemas.DatasetRegisterResponse)
-def register_dataset(
-    payload: schemas.DatasetRegisterRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: schemas.User = Depends(auth.get_current_user),
-):
-    root = Path(payload.path)
+def _resolve_dataset_root(path_value: str) -> Path:
+    root = Path(path_value)
     if not root.is_absolute():
         root = (settings.data_root / root).resolve()
-    if not root.exists():
-        raise HTTPException(status_code=404, detail="Path not found")
+    return root
 
+
+def _apply_dataset_mapping(root: Path, robot: Optional[str], task_type: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     mapped_robot = None
     mapped_task = None
-    if payload.robot or payload.task_type:
-        dataset_dirs = _find_dataset_dirs(root)
-        if not dataset_dirs:
-            raise HTTPException(
-                status_code=400,
-                detail="Please provide a dataset folder path (or a folder that contains datasets).",
-            )
-        map_path = settings.category_map_path
-        map_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"datasets": {}}
-        if map_path.exists():
-            try:
-                data = json.loads(map_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {"datasets": {}}
-        datasets = data.get("datasets")
-        if not isinstance(datasets, dict):
-            datasets = {}
-            data["datasets"] = datasets
-        for dataset_dir in dataset_dirs:
-            entry = datasets.get(dataset_dir.name, {})
-            if payload.robot:
-                entry["robot"] = payload.robot
-                mapped_robot = payload.robot
-            if payload.task_type:
-                entry["task_type"] = payload.task_type
-                mapped_task = payload.task_type
-            datasets[dataset_dir.name] = entry
-        map_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not robot and not task_type:
+        return mapped_robot, mapped_task
 
+    dataset_dirs = _find_dataset_dirs(root)
+    if not dataset_dirs:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a dataset folder path (or a folder that contains datasets).",
+        )
+
+    map_path = settings.category_map_path
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"datasets": {}}
+    if map_path.exists():
+        try:
+            data = json.loads(map_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"datasets": {}}
+
+    datasets = data.get("datasets")
+    if not isinstance(datasets, dict):
+        datasets = {}
+        data["datasets"] = datasets
+
+    for dataset_dir in dataset_dirs:
+        entry = datasets.get(dataset_dir.name, {})
+        if robot:
+            entry["robot"] = robot
+            mapped_robot = robot
+        if task_type:
+            entry["task_type"] = task_type
+            mapped_task = task_type
+        datasets[dataset_dir.name] = entry
+
+    map_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return mapped_robot, mapped_task
+
+
+def _create_index_task(db: Session, background_tasks: BackgroundTasks, root: Path) -> models.IndexTask:
     task = models.IndexTask(
         task_type="scan",
         target_path=str(root),
@@ -689,12 +782,162 @@ def register_dataset(
     db.add(task)
     db.commit()
     db.refresh(task)
-
     background_tasks.add_task(_run_index_task, task.id, str(root))
+    return task
+
+
+def _parse_lerobot_dataset(
+    root: Path,
+    dataset_name: Optional[str],
+    materialize_assets: bool,
+    overwrite_assets: bool,
+) -> tuple[str, dict[str, Any]]:
+    resolved_name = parser_service.infer_dataset_name(root, dataset_name)
+    try:
+        parsed = parser_service.parse_dataset(
+            root,
+            resolved_name,
+            materialize_assets=materialize_assets,
+            overwrite_assets=overwrite_assets,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to parse dataset: {exc}") from exc
+    return resolved_name, parsed
+
+
+def _build_lerobot_preview(parsed: dict[str, Any], dataset_name: str) -> dict[str, Any]:
+    return {
+        "dataset_name": dataset_name,
+        "dataset_info": parsed.get("dataset_info", {}),
+        "robot_info": parsed.get("robot_info", {}),
+        "tasks": parsed.get("tasks", []),
+        "episode_count": len(parsed.get("episodes", [])),
+    }
+
+
+def _create_lerobot_dataset_response(
+    payload: schemas.LeRobotCreateRequest | schemas.LeRobotUploadRequest,
+    background_tasks: BackgroundTasks,
+    db: Session,
+) -> schemas.LeRobotCreateResponse:
+    root = _resolve_dataset_root(payload.dataset_path)
+    dataset_name, parsed = _parse_lerobot_dataset(
+        root,
+        payload.dataset_name,
+        payload.materialize_assets,
+        payload.overwrite_assets,
+    )
+
+    parsed_robot, parsed_task, _ = parser_service.parse_dataset_name(dataset_name)
+    mapped_robot = payload.robot or parsed_robot or parsed.get("dataset_info", {}).get("robot_type")
+    mapped_task = payload.task_type or parsed_task
+    mapped_robot, mapped_task = _apply_dataset_mapping(root, mapped_robot, mapped_task)
+
+    preview = _build_lerobot_preview(parsed, dataset_name)
+
+    if payload.index_now:
+        task = _create_index_task(db, background_tasks, root)
+        return schemas.LeRobotCreateResponse(
+            success=True,
+            message="Dataset parsed and index task started",
+            taskId=task.id,
+            status="running",
+            datasetName=dataset_name,
+            mappedRobot=mapped_robot,
+            mappedTaskType=mapped_task,
+            parsed=preview,
+        )
+
+    return schemas.LeRobotCreateResponse(
+        success=True,
+        message="Dataset parsed successfully",
+        status="parsed",
+        datasetName=dataset_name,
+        mappedRobot=mapped_robot,
+        mappedTaskType=mapped_task,
+        parsed=preview,
+    )
+
+
+@app.post("/datasets/parse-lerobot", response_model=schemas.LeRobotParseResponse)
+def parse_lerobot_dataset(
+    payload: schemas.LeRobotParseRequest,
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    root = _resolve_dataset_root(payload.dataset_path)
+    _, parsed = _parse_lerobot_dataset(
+        root,
+        payload.dataset_name,
+        payload.materialize_assets,
+        payload.overwrite_assets,
+    )
+    return schemas.LeRobotParseResponse(**parsed)
+
+
+@app.post("/datasets/create-lerobot", response_model=schemas.LeRobotCreateResponse)
+def create_lerobot_dataset(
+    payload: schemas.LeRobotCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    return _create_lerobot_dataset_response(payload, background_tasks, db)
+
+
+@app.post("/datasets/upload-lerobot", response_model=schemas.LeRobotCreateResponse)
+def upload_lerobot_dataset(
+    payload: schemas.LeRobotUploadRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    return _create_lerobot_dataset_response(payload, background_tasks, db)
+
+
+@app.post("/datasets/register", response_model=schemas.DatasetRegisterResponse)
+def register_dataset(
+    payload: schemas.DatasetRegisterRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(auth.get_current_user),
+):
+    root = _resolve_dataset_root(payload.path)
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    mapped_robot = payload.robot
+    mapped_task = payload.task_type
+    generated_assets = False
+
+    if lerobot_v3.is_v3_dataset_root(root):
+        dataset_name = parser_service.infer_dataset_name(root, payload.dataset_name)
+        is_valid_name, error_message = parser_service.validate_dataset_name(dataset_name)
+        if not is_valid_name:
+            raise HTTPException(status_code=400, detail=error_message)
+
+        parsed_robot, parsed_task, _ = parser_service.parse_dataset_name(dataset_name)
+        mapped_robot = mapped_robot or parsed_robot
+        mapped_task = mapped_task or parsed_task
+
+        if payload.materialize_assets:
+            _parse_lerobot_dataset(root, dataset_name, True, payload.overwrite_assets)
+            generated_assets = True
+
+    mapped_robot, mapped_task = _apply_dataset_mapping(root, mapped_robot, mapped_task)
+    task = _create_index_task(db, background_tasks, root)
+
+    message = "Index task started"
+    if generated_assets:
+        message = "Media assets generated and index task started"
+
     return schemas.DatasetRegisterResponse(
         taskId=task.id,
         status="running",
-        message="Index task started",
+        message=message,
         mappedRobot=mapped_robot,
         mappedTaskType=mapped_task,
     )

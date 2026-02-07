@@ -71,6 +71,7 @@ class ItemSummary(BaseModel):
     episodeId: Optional[str] = None
     robot: Optional[str] = None
     taskType: Optional[str] = None
+    storagePath: Optional[str] = None
     thumbnailUrl: Optional[str] = None
     totalFrames: Optional[int] = None
     duration: Optional[float] = None
@@ -112,6 +113,7 @@ class ItemDetail(BaseModel):
     robot: RobotInfo
     taskType: TaskTypeInfo
     filePath: str
+    storagePath: Optional[str] = None
     totalFrames: Optional[int] = None
     fps: Optional[float] = None
     duration: Optional[float] = None
@@ -145,8 +147,11 @@ class IndexStatusResponse(BaseModel):
 
 class DatasetRegisterRequest(BaseModel):
     path: str
+    dataset_name: Optional[str] = Field(default=None, alias="dataset_name")
     robot: Optional[str] = None
     task_type: Optional[str] = Field(default=None, alias="task_type")
+    materialize_assets: bool = Field(default=False, alias="materialize_assets")
+    overwrite_assets: bool = Field(default=False, alias="overwrite_assets")
 
 
 class DatasetRegisterResponse(BaseModel):
@@ -155,6 +160,59 @@ class DatasetRegisterResponse(BaseModel):
     message: str
     mappedRobot: Optional[str] = None
     mappedTaskType: Optional[str] = None
+
+
+class DatasetDeleteResponse(BaseModel):
+    success: bool
+    message: str
+    deletedCount: int
+
+
+class ItemDeleteResponse(BaseModel):
+    success: bool
+    message: str
+    itemId: int
+
+
+class LeRobotParseRequest(BaseModel):
+    dataset_path: str = Field(alias="dataset_path")
+    dataset_name: Optional[str] = Field(default=None, alias="dataset_name")
+    materialize_assets: bool = Field(default=False, alias="materialize_assets")
+    overwrite_assets: bool = Field(default=False, alias="overwrite_assets")
+
+
+class LeRobotParseResponse(BaseModel):
+    success: bool
+    message: str
+    dataset_info: dict[str, Any]
+    robot_info: dict[str, Any]
+    tasks: list[dict[str, Any]]
+    episodes: list[dict[str, Any]]
+
+
+class LeRobotCreateRequest(BaseModel):
+    dataset_path: str = Field(alias="dataset_path")
+    dataset_name: Optional[str] = Field(default=None, alias="dataset_name")
+    robot: Optional[str] = None
+    task_type: Optional[str] = Field(default=None, alias="task_type")
+    index_now: bool = Field(default=True, alias="index_now")
+    materialize_assets: bool = Field(default=False, alias="materialize_assets")
+    overwrite_assets: bool = Field(default=False, alias="overwrite_assets")
+
+
+class LeRobotUploadRequest(LeRobotCreateRequest):
+    pass
+
+
+class LeRobotCreateResponse(BaseModel):
+    success: bool
+    message: str
+    taskId: Optional[int] = None
+    status: Optional[str] = None
+    datasetName: Optional[str] = None
+    mappedRobot: Optional[str] = None
+    mappedTaskType: Optional[str] = None
+    parsed: Optional[dict[str, Any]] = None
 
 
 class RerunGenerateRequest(BaseModel):

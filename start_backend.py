@@ -16,13 +16,13 @@ if __name__ == '__main__':
     db_path = (repo_root / "lerobot_dataset_v2.db").as_posix()
     data_root = (repo_root / "project" / "data").as_posix()
 
-    os.environ['DATABASE_URL'] = f'sqlite:///{db_path}'
-    os.environ['DATA_ROOT'] = data_root
-    os.environ['JWT_SECRET'] = 'dev-secret'
-    os.environ['ADMIN_USERNAME'] = 'admin'
-    os.environ['ADMIN_PASSWORD'] = 'admin'
-    os.environ['CORS_ORIGINS'] = 'http://localhost:5090,http://127.0.0.1:5090'
-    os.environ['PRIMARY_CAMERA_KEY'] = 'top'
+    os.environ.setdefault('DATABASE_URL', f'sqlite:///{db_path}')
+    os.environ.setdefault('DATA_ROOT', data_root)
+    os.environ.setdefault('JWT_SECRET', 'dev-secret')
+    os.environ.setdefault('ADMIN_USERNAME', 'admin')
+    os.environ.setdefault('ADMIN_PASSWORD', 'admin')
+    os.environ.setdefault('CORS_ORIGINS', 'http://localhost:5090,http://127.0.0.1:5090')
+    os.environ.setdefault('PRIMARY_CAMERA_KEY', 'top')
 
     print("=" * 50)
     print("Starting LeRobot Backend Server")
