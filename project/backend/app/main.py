@@ -119,7 +119,7 @@ def _dataset_path_filter(dataset_path: str):
     )
 
 
-def _delete_dataset_items(db: Session, dataset_path: str) -> int:
+def _delete_items_for_dataset_path(db: Session, dataset_path: str) -> int:
     items = db.query(models.Item).filter(_dataset_path_filter(dataset_path)).all()
     for item in items:
         db.delete(item)
@@ -140,7 +140,7 @@ def _cleanup_orphan_entities(db: Session) -> None:
         db.delete(robot)
 
 
-def _normalize_non_empty(value: Optional[str], field_name: str) -> str:
+def _require_non_empty_value(value: Optional[str], field_name: str) -> str:
     normalized = (value or "").strip()
     if not normalized:
         raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty")
@@ -177,7 +177,7 @@ def _upsert_task_type(db: Session, robot: models.Robot, name: str) -> models.Tas
     return task_type
 
 
-def _resolve_target_robot_task(
+def _resolve_robot_and_task_for_item(
     db: Session,
     current_item: models.Item,
     robot: Optional[str],
@@ -189,8 +189,8 @@ def _resolve_target_robot_task(
     if robot_name is None or task_name is None:
         raise HTTPException(status_code=400, detail="robot and task_type are required")
 
-    robot_entity = _upsert_robot(db, _normalize_non_empty(robot_name, "robot"))
-    task_entity = _upsert_task_type(db, robot_entity, _normalize_non_empty(task_name, "task_type"))
+    robot_entity = _upsert_robot(db, _require_non_empty_value(robot_name, "robot"))
+    task_entity = _upsert_task_type(db, robot_entity, _require_non_empty_value(task_name, "task_type"))
     return robot_entity, task_entity
 
 
@@ -530,8 +530,8 @@ def get_item(
 def update_dataset(
     datasetId: str,
     payload: schemas.DatasetUpdateRequest,
-    update_local: bool = Query(default=True, alias="update_local"),
-    force_local: bool = Query(default=True, alias="force_local"),
+    apply_local_changes: bool = Query(default=True, alias="update_local"),
+    force_local_unlock: bool = Query(default=True, alias="force_local"),
     db: Session = Depends(get_db),
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
@@ -545,15 +545,15 @@ def update_dataset(
     if not items:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    requested_robot = _normalize_non_empty(payload.robot, "robot") if payload.robot is not None else None
-    requested_task = _normalize_non_empty(payload.task_type, "task_type") if payload.task_type is not None else None
-    requested_storage = (
-        _normalize_non_empty(payload.storage_path, "storage_path")
+    requested_robot = _require_non_empty_value(payload.robot, "robot") if payload.robot is not None else None
+    requested_task_type = _require_non_empty_value(payload.task_type, "task_type") if payload.task_type is not None else None
+    requested_storage_path = (
+        _require_non_empty_value(payload.storage_path, "storage_path")
         if payload.storage_path is not None
         else None
     )
 
-    if update_local:
+    if apply_local_changes:
         local_root = Path(dataset_path).expanduser().resolve()
         if not local_root.exists():
             raise HTTPException(status_code=404, detail=f"Local dataset path not found: {local_root}")
@@ -561,19 +561,19 @@ def update_dataset(
         desired_root = local_root
         local_changed = False
 
-        if requested_storage is not None:
-            desired_root = Path(requested_storage).expanduser().resolve()
-        elif requested_robot is not None or requested_task is not None:
+        if requested_storage_path is not None:
+            desired_root = Path(requested_storage_path).expanduser().resolve()
+        elif requested_robot is not None or requested_task_type is not None:
             parsed_robot, parsed_task, parsed_date = parser_service.parse_dataset_name(local_root.name)
             resolved_robot = requested_robot or parsed_robot or (items[0].robot.name if items[0].robot else None)
-            resolved_task = requested_task or parsed_task or (items[0].task_type.name if items[0].task_type else None)
+            resolved_task = requested_task_type or parsed_task or (items[0].task_type.name if items[0].task_type else None)
             if resolved_robot and resolved_task:
                 date_token = parsed_date or datetime.utcnow().date().isoformat()
                 desired_root = local_root.with_name(f"{resolved_robot}_{resolved_task}_{date_token}")
 
         if desired_root != local_root:
             try:
-                desired_root = dataset_editor.move_dataset_root(local_root, desired_root, force_unlock=force_local)
+                desired_root = dataset_editor.move_dataset_root(local_root, desired_root, force_unlock=force_local_unlock)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except PermissionError as exc:
@@ -587,7 +587,7 @@ def update_dataset(
             metadata_changed = dataset_editor.update_v3_dataset_metadata(
                 local_root,
                 robot=requested_robot,
-                task_type=requested_task,
+                task_type=requested_task_type,
             )
             local_changed = local_changed or metadata_changed
         except Exception as exc:
@@ -595,8 +595,8 @@ def update_dataset(
 
         if local_changed:
             try:
-                _delete_dataset_items(db, dataset_path)
-                _delete_dataset_items(db, str(local_root))
+                _delete_items_for_dataset_path(db, dataset_path)
+                _delete_items_for_dataset_path(db, str(local_root))
                 _cleanup_orphan_entities(db)
                 db.commit()
 
@@ -641,12 +641,12 @@ def update_dataset(
 
     target_robot = None
     target_task_type = None
-    if requested_robot is not None or requested_task is not None:
-        target_robot, target_task_type = _resolve_target_robot_task(
+    if requested_robot is not None or requested_task_type is not None:
+        target_robot, target_task_type = _resolve_robot_and_task_for_item(
             db,
             items[0],
             requested_robot,
-            requested_task,
+            requested_task_type,
         )
 
     updated_count = 0
@@ -661,8 +661,8 @@ def update_dataset(
             item.task_type_id = target_task_type.id
             changed = True
 
-        if requested_storage is not None and item.storage_path != requested_storage:
-            item.storage_path = requested_storage
+        if requested_storage_path is not None and item.storage_path != requested_storage_path:
+            item.storage_path = requested_storage_path
             changed = True
 
         if changed:
@@ -686,7 +686,7 @@ def update_dataset(
             if first_item.task_type
             else None
         ),
-        storagePath=requested_storage if requested_storage is not None else dataset_path,
+        storagePath=requested_storage_path if requested_storage_path is not None else dataset_path,
     )
 
 
@@ -694,8 +694,8 @@ def update_dataset(
 def update_item(
     itemId: int,
     payload: schemas.ItemUpdateRequest,
-    update_local: bool = Query(default=False, alias="update_local"),
-    force_local: bool = Query(default=True, alias="force_local"),
+    apply_local_changes: bool = Query(default=False, alias="update_local"),
+    force_local_unlock: bool = Query(default=True, alias="force_local"),
     db: Session = Depends(get_db),
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
@@ -708,17 +708,17 @@ def update_item(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    requested_episode_id = _normalize_non_empty(payload.episode_id, "episode_id") if payload.episode_id is not None else None
-    requested_file_path = _normalize_non_empty(payload.file_path, "file_path") if payload.file_path is not None else None
+    requested_episode_id = _require_non_empty_value(payload.episode_id, "episode_id") if payload.episode_id is not None else None
+    requested_file_path = _require_non_empty_value(payload.file_path, "file_path") if payload.file_path is not None else None
     requested_storage_path = (
-        _normalize_non_empty(payload.storage_path, "storage_path")
+        _require_non_empty_value(payload.storage_path, "storage_path")
         if payload.storage_path is not None
         else None
     )
-    requested_robot = _normalize_non_empty(payload.robot, "robot") if payload.robot is not None else None
-    requested_task = _normalize_non_empty(payload.task_type, "task_type") if payload.task_type is not None else None
+    requested_robot = _require_non_empty_value(payload.robot, "robot") if payload.robot is not None else None
+    requested_task_type = _require_non_empty_value(payload.task_type, "task_type") if payload.task_type is not None else None
 
-    if update_local:
+    if apply_local_changes:
         dataset_root = _dataset_root_for_item(item)
         if lerobot_v3.is_v3_dataset_root(dataset_root):
             raise HTTPException(
@@ -731,7 +731,7 @@ def update_item(
                 moved_path = dataset_editor.move_dataset_root(
                     Path(item.file_path),
                     Path(requested_file_path),
-                    force_unlock=force_local,
+                    force_unlock=force_local_unlock,
                 )
                 requested_file_path = str(moved_path)
             except ValueError as exc:
@@ -743,12 +743,12 @@ def update_item(
 
     changed = False
 
-    if requested_robot is not None or requested_task is not None:
-        target_robot, target_task_type = _resolve_target_robot_task(
+    if requested_robot is not None or requested_task_type is not None:
+        target_robot, target_task_type = _resolve_robot_and_task_for_item(
             db,
             item,
             requested_robot,
-            requested_task,
+            requested_task_type,
         )
         if item.robot_id != target_robot.id:
             item.robot_id = target_robot.id
@@ -788,7 +788,7 @@ def delete_dataset(
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
     dataset_path = _decode_dataset_id(datasetId)
-    deleted_count = _delete_dataset_items(db, dataset_path)
+    deleted_count = _delete_items_for_dataset_path(db, dataset_path)
     if deleted_count <= 0:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
@@ -804,8 +804,8 @@ def delete_dataset(
 @app.delete("/items/{itemId}", response_model=schemas.ItemDeleteResponse)
 def delete_item(
     itemId: int,
-    delete_local: bool = Query(default=True, alias="delete_local"),
-    force_local: bool = Query(default=True, alias="force_local"),
+    delete_local_files: bool = Query(default=True, alias="delete_local"),
+    force_local_unlock: bool = Query(default=True, alias="force_local"),
     db: Session = Depends(get_db),
     current_user: schemas.User = Depends(auth.get_current_user),
 ):
@@ -815,13 +815,13 @@ def delete_item(
 
     dataset_root = _dataset_root_for_item(item)
 
-    if delete_local and dataset_root.exists() and lerobot_v3.is_v3_dataset_root(dataset_root):
+    if delete_local_files and dataset_root.exists() and lerobot_v3.is_v3_dataset_root(dataset_root):
         episode_index = lerobot_v3.parse_episode_index(item.episode_id)
         if episode_index is None:
             raise HTTPException(status_code=400, detail="Episode index not found")
 
         try:
-            dataset_editor.delete_v3_episode(dataset_root, episode_index, force_unlock=force_local)
+            dataset_editor.delete_v3_episode(dataset_root, episode_index, force_unlock=force_local_unlock)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except PermissionError as exc:
@@ -829,7 +829,7 @@ def delete_item(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to delete local episode: {exc}") from exc
 
-        _delete_dataset_items(db, str(dataset_root))
+        _delete_items_for_dataset_path(db, str(dataset_root))
         db.commit()
 
         try:
@@ -850,7 +850,7 @@ def delete_item(
         )
 
     local_deleted = False
-    if delete_local:
+    if delete_local_files:
         try:
             local_deleted = dataset_editor.delete_episode_file(Path(item.file_path))
         except Exception as exc:
@@ -862,9 +862,9 @@ def delete_item(
     db.commit()
 
     message = "Episode deleted from database"
-    if delete_local and local_deleted:
+    if delete_local_files and local_deleted:
         message = "Episode deleted locally and from database"
-    elif delete_local and not local_deleted:
+    elif delete_local_files and not local_deleted:
         message = "Local episode file not found; removed from database"
 
     return schemas.ItemDeleteResponse(
