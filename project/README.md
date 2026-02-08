@@ -1,73 +1,88 @@
-# Dataset Viz
+# Dataset Viz ????
 
-Dataset Viz is a local-first LeRobot dataset management and visualization system.
+## 1. ????
 
-## What Is Included
-- Frontend SPA (Vue 3): `project/frontend/index.html`
-- Backend API (FastAPI): `project/backend/app/main.py`
-- API documentation: `project/backend/API.md`
+Dataset Viz ?????? LeRobot ?????????????????????????
 
-## Frontend/Backend Separation
-- Frontend files are under `project/frontend/`.
-- Backend code is under `project/backend/`.
-- Compatibility page `project/111.html` redirects to `project/frontend/index.html`.
+## 2. ???????
 
-## Main Capabilities
-- Login and JWT-based session flow.
-- Register local dataset paths and run async indexing.
-- Browse robots, task types, datasets, and episodes.
-- Episode detail visualization (video + timeseries).
-- Update dataset/episode metadata and path fields.
-- Delete dataset/episode with optional local filesystem sync.
-- Generate/serve Rerun visualization outputs.
+- ?????`project/frontend/index.html`
+- ?????`project/backend/app/main.py`
+- ?????`project/111.html` -> `project/frontend/index.html`
 
-## Quick Start
+## 3. ?????
 
-### 1) Start backend
-From repository root:
+### 3.1 ??
+- `POST /auth/login`
+- `POST /auth/refresh`
+- `GET /auth/me`
+
+### 3.2 ?????
+- `POST /datasets/register`
+- `POST /index/scan`
+- `GET /index/status`
+
+### 3.3 ????
+- `GET /robots`
+- `GET /task-types`
+- `GET /datasets`
+- `GET /datasets/{datasetId}/items`
+- `GET /items`
+- `GET /items/{itemId}`
+
+### 3.4 ???
+- `GET /items/{itemId}/stream`
+- `GET /items/{itemId}/thumbnail`
+- `GET /items/{itemId}/timeseries`
+- `POST /items/{itemId}/visualize/rrd`
+- `POST /items/{itemId}/visualize/server`
+
+### 3.5 ?????
+- ??????`PUT /datasets/{datasetId}`??? `update_local` / `force_local`?
+- Episode ???`PUT /items/{itemId}`??? `update_local` / `force_local`?
+- ??????`DELETE /datasets/{datasetId}`
+- Episode ???`DELETE /items/{itemId}`??? `delete_local` / `force_local`?
+
+## 4. ???????
+
+- ?????????`update*`?`datasetForm`?`loading.datasets`
+- ?????????`apply_local_changes`?`requested_storage_path` ?
+- ??????????????????????
+- ???????
+  - `project/backend/API.md`
+  - `project/frontend/README.md`
+  - `project/backend/README.md`
+  - `project/FRAMEWORK.md`
+
+## 5. ????
+
+### ????
 
 ```powershell
 python start_backend.py
 ```
 
-Backend URLs:
-- `http://127.0.0.1:8899/docs`
-- `http://127.0.0.1:8899/openapi.json`
-
-### 2) Start frontend
+### ????
 
 ```powershell
 cd project
 python -m http.server 5090
 ```
 
-Frontend URLs:
+???
 - `http://127.0.0.1:5090/frontend/index.html`
-- `http://127.0.0.1:5090/111.html` (compatibility redirect)
+- `http://127.0.0.1:8899/docs`
 
-## Naming Rule (LeRobot v3)
-Dataset folders should follow:
+## 6. ??????
 
-```text
-{robot_type}_{task_name}_{YYYY-MM-DD}
-```
+???????
+1. ?????????????
+2. ?????/episode?????????????
+3. ?? episode ???????????????????
+4. ??/???/??/Rerun ???????
 
-Example:
+## 7. ????
 
-```text
-so101_cleandesk_2000-01-01
-```
-
-## Leadership Review Checklist
-- Dataset registration and indexing complete successfully.
-- Dataset/episode lists and details load correctly.
-- Update endpoints change DB/local state as expected.
-- Delete endpoints synchronize DB/local state as expected.
-- Stream/thumbnail/timeseries/Rerun endpoints are available.
-
-## Related Docs
-- Frontend guide: `project/frontend/README.md`
-- Backend guide: `project/backend/README.md`
-- Backend API spec (human-readable): `project/backend/API.md`
-- Full architecture notes: `project/ARCHITECTURE.md`
-- Framework report: `project/FRAMEWORK.md`
+- ??????`project/FRAMEWORK.md`
+- API ?????`project/backend/API.md`
+- ???????`project/ARCHITECTURE.md`
