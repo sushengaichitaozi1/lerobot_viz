@@ -70,3 +70,4 @@ so101_cleandesk_2000-01-01
 - Backend guide: `project/backend/README.md`
 - Backend API spec (human-readable): `project/backend/API.md`
 - Full architecture notes: `project/ARCHITECTURE.md`
+- Framework report: `project/FRAMEWORK.md`
